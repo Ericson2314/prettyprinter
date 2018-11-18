@@ -64,6 +64,8 @@ library
 
     build-depends:
           base >= 4.7 && < 5
+        , data-fix
+        , free >= 5 && < 6
         , text >= 1.2
 
     if impl(ghc >= 8.0)
@@ -72,6 +74,7 @@ library
         build-depends: semigroups >= 0.1
     if !impl(ghc >= 7.10)
         build-depends: void
+        build-depends: bifunctor
 
 
 

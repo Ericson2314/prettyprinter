@@ -1,10 +1,15 @@
 {-# LANGUAGE AutoDeriveTypeable  #-}
 {-# LANGUAGE BangPatterns        #-}
 {-# LANGUAGE CPP                 #-}
+{-# LANGUAGE DeriveFunctor       #-}
+{-# LANGUAGE DeriveFoldable      #-}
+{-# LANGUAGE DeriveTraversable   #-}
 {-# LANGUAGE DefaultSignatures   #-}
 {-# LANGUAGE DeriveGeneric       #-}
 {-# LANGUAGE LambdaCase          #-}
 {-# LANGUAGE OverloadedStrings   #-}
+{-# LANGUAGE PatternSynonyms     #-}
+{-# LANGUAGE Rank2Types          #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
 #include "version-compatibility-macros.h"
@@ -22,7 +27,10 @@ module Data.Text.Prettyprint.Doc.Internal (
 
 
 
+import           Control.Comonad.Cofree
 import           Control.Applicative
+import           Data.Fix
+import           Data.Functor.Sum
 import           Data.Int
 import           Data.List.NonEmpty  (NonEmpty (..))
 import           Data.Maybe
@@ -32,11 +40,13 @@ import qualified Data.Text           as T
 import qualified Data.Text.Lazy      as Lazy
 import           Data.Void
 import           Data.Word
+import           Data.Traversable
 import           GHC.Generics        (Generic)
 
--- Depending on the Cabal file, this might be from base, or for older builds,
+-- Depending on the Cabal file, these might be from base, or for older builds,
 -- from the semigroups package.
-import Data.Semigroup
+import Data.Semigroup hiding (Sum)
+import Data.Bifunctor
 
 #if NATURAL_IN_BASE
 import Numeric.Natural
@@ -69,8 +79,8 @@ import Data.Text.Prettyprint.Doc.Render.Util.Panic
 -- document.
 --
 -- The annotation is an arbitrary piece of data associated with (part of) a
--- document. Annotations may be used by the rendering backends in order to
--- display output differently, such as
+-- document. It is an extra variant vs free. Annotations may be used by the
+-- rendering backends in order to display output differently, such as
 --
 --   - color information (e.g. when rendering to the terminal)
 --   - mouseover text (e.g. when rendering to rich HTML)
@@ -81,7 +91,79 @@ import Data.Text.Prettyprint.Doc.Render.Util.Panic
 -- >>> putStrLn (show (vsep ["hello", "world"]))
 -- hello
 -- world
-data Doc ann =
+newtype Doc ann = Doc { unDoc :: DocNG (Annotate ann) }
+
+-- | 'DocNG' is perhaps what 'Doc' should be, without the newtype. The functor
+-- parameter is strictly more expressive than an anotation parameter
+type DocNG f = Fix (Sum DocF f)
+
+data Annotate a d = Annotate a d
+    deriving (Generic, Functor, Foldable, Traversable)
+
+instance Bifunctor Annotate where
+  bimap f g (Annotate x y) = Annotate (f x) (g y)
+
+unannotated :: f (Fix (Sum f g)) -> Fix (Sum f g)
+unannotated = Fix . InL
+
+pattern Unan :: f (Fix (Sum f g)) -> Fix (Sum f g)
+pattern Unan x = Fix (InL x)
+
+pattern UnanD :: DocF (DocNG (Annotate ann)) -> Doc ann
+pattern UnanD x = Doc (Fix (InL x))
+
+bimap' :: (f a -> f' b) -> (g a -> g' b) -> Sum f g a -> Sum f' g' b
+bimap' f g = \case
+    InL x -> InL $ f x
+    InR x -> InR $ g x
+
+first' :: (f a -> f' a) -> Sum f g a -> Sum f' g a
+first' f = bimap' f id
+
+second' :: (g a -> g' a) -> Sum f g a -> Sum f g' a
+second' f = bimap' id f
+
+bitraverse' :: Functor t => (f a -> t (f' b)) -> (g a -> t (g' b)) -> Sum f g a -> t (Sum f' g' b)
+bitraverse' f g = \case
+    InL x -> InL <$> f x
+    InR x -> InR <$> g x
+
+bimapLang
+  :: (Functor f, Functor f', Functor g, Functor g')
+  => (f (Fix (Sum f' g')) -> f' (Fix (Sum f' g')))
+  -> (g (Fix (Sum f' g')) -> g' (Fix (Sum f' g')))
+  -> Fix (Sum f  g)
+  -> Fix (Sum f' g')
+bimapLang f g = bimapLang' (Fix . InL . f) (Fix . InR . g)
+
+bimapLang'
+  :: (Functor f, Functor f', Functor g, Functor g')
+  => (f (Fix (Sum f' g')) -> Fix (Sum f' g'))
+  -> (g (Fix (Sum f' g')) -> Fix (Sum f' g'))
+  -> Fix (Sum f  g)
+  -> Fix (Sum f' g')
+bimapLang' f g = go
+  where
+    go = \case
+        Fix (InL x) -> f $ go <$> x
+        Fix (InR x) -> g $ go <$> x
+
+bitraverseLang
+  :: (Monad m, Traversable f, Traversable f', Traversable g, Traversable g')
+  => (f (Fix (Sum f' g')) -> m (Fix (Sum f' g')))
+  -> (g (Fix (Sum f' g')) -> m (Fix (Sum f' g')))
+  -> Fix (Sum f  g)
+  -> m (Fix (Sum f' g'))
+bitraverseLang f g = go
+  where
+    go = \case
+        Fix (InL x) -> f =<< traverse go x
+        Fix (InR x) -> g =<< traverse go x
+
+
+-- | The abstract data type @'DocF'@ one "layer" of pretty document. The @d@ is
+-- a stub where children would go.
+data DocF d =
 
     -- | Occurs when flattening a line. The layouter will reject this document,
     -- choosing a more suitable rendering.
@@ -107,32 +189,28 @@ data Doc ann =
     -- | Lay out the first 'Doc', but when flattened (via 'group'), fall back to
     -- the second. The flattened version should in general be higher and
     -- narrower than the fallback.
-    | FlatAlt (Doc ann) (Doc ann)
+    | FlatAlt d d
 
     -- | Concatenation of two documents
-    | Cat (Doc ann) (Doc ann)
+    | Cat d d
 
     -- | Document indented by a number of columns
-    | Nest !Int (Doc ann)
+    | Nest !Int d
 
     -- | Invariant: The first lines of first document should be longer than the
     -- first lines of the second one, so the layout algorithm can pick the one
     -- that fits best. Used to implement layout alternatives for 'group'.
-    | Union (Doc ann) (Doc ann)
+    | Union d d
 
     -- | React on the current cursor position, see 'column'
-    | Column (Int -> Doc ann)
+    | Column (Int -> d)
 
     -- | React on the document's width, see 'pageWidth'
-    | WithPageWidth (PageWidth -> Doc ann)
+    | WithPageWidth (PageWidth -> d)
 
     -- | React on the current nesting level, see 'nesting'
-    | Nesting (Int -> Doc ann)
-
-    -- | Add an annotation to the enclosed 'Doc'. Can be used for example to add
-    -- styling directives or alt texts that can then be used by the renderer.
-    | Annotated ann (Doc ann)
-    deriving (Generic)
+    | Nesting (Int -> d)
+    deriving (Generic, Functor)
 
 -- |
 -- @
@@ -142,7 +220,7 @@ data Doc ann =
 -- >>> "hello" <> "world" :: Doc ann
 -- helloworld
 instance Semigroup (Doc ann) where
-    (<>) = Cat
+    (Doc x) <> (Doc y) = UnanD $ Cat x y
     sconcat (x :| xs) = hcat (x:xs)
 
 -- |
@@ -245,7 +323,7 @@ instance Pretty Bool where
 -- string
 instance Pretty Char where
     pretty '\n' = line
-    pretty c = Char c
+    pretty c = Doc $ unannotated $ Char c
 
     prettyList = pretty . (id :: Text -> Text) . fromString
 
@@ -375,10 +453,11 @@ instance Pretty Void where pretty = absurd
 -- invariant of the 'Text' constructor.
 unsafeTextWithoutNewlines :: Text -> Doc ann
 unsafeTextWithoutNewlines text = case T.uncons text of
-    Nothing -> Empty
-    Just (t,ext)
-        | T.null ext -> Char t
-        | otherwise -> Text (T.length text) text
+    Nothing -> UnanD $ Empty
+    Just (t,ext) -> UnanD $
+        if T.null ext
+        then Char t
+        else Text (T.length text) text
 
 -- | The empty document behaves like @('pretty' "")@, so it has a height of 1.
 -- This may lead to surprising behaviour if we expect it to bear no weight
@@ -392,7 +471,7 @@ unsafeTextWithoutNewlines text = case T.uncons text of
 --
 -- Together with '<>', 'emptyDoc' forms the 'Monoid' 'Doc'.
 emptyDoc :: Doc ann
-emptyDoc = Empty
+emptyDoc = UnanD $ Empty
 
 -- | @('nest' i x)@ lays out the document @x@ with the current indentation level
 -- increased by @i@. Negative values are allowed, and decrease the nesting level
@@ -411,7 +490,7 @@ nest
     -> Doc ann
     -> Doc ann
 nest 0 x = x -- Optimization
-nest i x = Nest i x
+nest i (Doc x) = UnanD $ Nest i x
 
 -- | The @'line'@ document advances to the next line and indents to the current
 -- nesting level.
@@ -426,7 +505,7 @@ nest i x = Nest i x
 -- >>> group doc
 -- lorem ipsum dolor sit amet
 line :: Doc ann
-line = FlatAlt Line (Char ' ')
+line = UnanD $ FlatAlt (unannotated Line) (unannotated $ Char ' ')
 
 -- | @'line''@ is like @'line'@, but behaves like @'mempty'@ if the line break
 -- is undone by 'group' (instead of @'space'@).
@@ -438,7 +517,7 @@ line = FlatAlt Line (Char ' ')
 -- >>> group doc
 -- lorem ipsumdolor sit amet
 line' :: Doc ann
-line' = FlatAlt Line mempty
+line' = UnanD $ FlatAlt (unannotated Line) $ unDoc mempty
 
 -- | @softline@ behaves like @'space'@ if the resulting output fits the page,
 -- otherwise like @'line'@.
@@ -496,7 +575,7 @@ softline' = group line'
 -- lorem ipsum
 -- dolor sit amet
 hardline :: Doc ann
-hardline = Line
+hardline = UnanD Line
 
 -- | @('group' x)@ tries laying out @x@ into a single line by removing the
 -- contained line breaks; if this does not fit the page, @x@ is laid out without
@@ -509,7 +588,7 @@ group :: Doc ann -> Doc ann
 -- See note [Group: special flattening]
 group x = case changesUponFlattening x of
     Nothing -> x
-    Just x' -> Union x' x
+    Just (Doc x') -> UnanD $ Union x' $ unDoc x
 
 -- Note [Group: special flattening]
 --
@@ -532,46 +611,52 @@ group x = case changesUponFlattening x of
 -- if the document is static (e.g. contains only a plain 'Empty' node). See
 -- [Group: special flattening] for further explanations.
 changesUponFlattening :: Doc ann -> Maybe (Doc ann)
-changesUponFlattening = \case
+changesUponFlattening (Doc (Fix x)) = Doc <$> case x of
+  InR x -> pure $ Fix $ InR x
+  InL x -> changesUponFlatteningNG x
+
+-- Unrolled one layer of the types, since we can only flat
+changesUponFlatteningNG
+  :: forall f. Traversable f
+  => DocF (DocNG f)
+  -> Maybe (DocNG f)
+changesUponFlatteningNG = \case
+    _ -> Nothing
     FlatAlt _ y     -> Just (flatten y)
-    Line            -> Just Fail
-    Union x _       -> changesUponFlattening x <|> Just x
-    Nest i x        -> fmap (Nest i) (changesUponFlattening x)
-    Annotated ann x -> fmap (Annotated ann) (changesUponFlattening x)
+    Line            -> Just $ unannotated Fail
+    Union x _       -> recur x <|> Just x
+    Nest i x        -> fmap (unannotated . Nest i) (recur x)
 
-    Column f        -> Just (Column (flatten . f))
-    Nesting f       -> Just (Nesting (flatten . f))
-    WithPageWidth f -> Just (WithPageWidth (flatten . f))
+    Column f        -> Just (unannotated $ Column (flatten . f))
+    Nesting f       -> Just (unannotated $ Nesting (flatten . f))
+    WithPageWidth f -> Just (unannotated $ WithPageWidth (flatten . f))
 
-    Cat x y -> case (changesUponFlattening x, changesUponFlattening y) of
-        (Nothing, Nothing) -> Nothing
-        (Just x', Nothing) -> Just (Cat x' y )
-        (Nothing, Just y') -> Just (Cat x  y')
-        (Just x', Just y') -> Just (Cat x' y')
+    Cat x y -> unannotated <$> liftA2 Cat (recur x <|> Just x) (recur y <|> Just y)
 
     Empty  -> Nothing
     Char{} -> Nothing
     Text{} -> Nothing
     Fail   -> Nothing
   where
+    recur :: DocNG f -> Maybe (DocNG f)
+    recur = \case
+        Fix (InL x) -> changesUponFlatteningNG x
+        Fix (InR x) -> Fix <$> InR <$> mapM recur x
+
     -- Flatten, but don’t report whether anything changes.
-    flatten :: Doc ann -> Doc ann
-    flatten = \case
-        FlatAlt _ y     -> flatten y
-        Cat x y         -> Cat (flatten x) (flatten y)
-        Nest i x        -> Nest i (flatten x)
-        Line            -> Fail
-        Union x _       -> flatten x
-        Column f        -> Column (flatten . f)
-        WithPageWidth f -> WithPageWidth (flatten . f)
-        Nesting f       -> Nesting (flatten . f)
-        Annotated ann x -> Annotated ann (flatten x)
+    flatten :: DocNG f -> DocNG f
+    flatten = bimapLang' flatten' (Fix . InR)
 
-        x@Fail   -> x
-        x@Empty  -> x
-        x@Char{} -> x
-        x@Text{} -> x
+    flatten' :: Functor f' => DocF (Fix (Sum DocF f')) -> Fix (Sum DocF f')
+    flatten' = \case
+        FlatAlt _ y -> y
+        Union x _   -> x
+        others      -> unannotated others
 
+        x@Fail   -> unannotated x
+        x@Empty  -> unannotated x
+        x@Char{} -> unannotated x
+        x@Text{} -> unannotated x
 
 
 -- | @('flatAlt' x fallback)@ renders as @x@ by default, but falls back to
@@ -610,9 +695,7 @@ flatAlt
     :: Doc ann -- ^ Default
     -> Doc ann -- ^ Fallback when 'group'ed
     -> Doc ann
-flatAlt = FlatAlt
-
-
+flatAlt (Doc x) (Doc y) = UnanD $ FlatAlt x y
 
 -- | @('align' x)@ lays out the document @x@ with the nesting level set to the
 -- current column. It is used for example to implement 'hang'.
@@ -763,7 +846,7 @@ tupled = group . encloseSep (flatAlt "( " "(")
 -- x '<+>' y = x '<>' 'space' '<>' y
 -- @
 (<+>) :: Doc ann -> Doc ann -> Doc ann
-x <+> y = x <> Char ' ' <> y
+x <+> y = x <> UnanD (Char ' ') <> y
 
 
 
@@ -1017,7 +1100,7 @@ punctuate p = go
 --     prefix | <- column 11
 --         prefix | <- column 15
 column :: (Int -> Doc ann) -> Doc ann
-column = Column
+column f = UnanD $ Column $ unDoc . f
 
 -- | Layout a document depending on the current 'nest'ing level. 'align' is
 -- implemented in terms of 'nesting'.
@@ -1028,7 +1111,7 @@ column = Column
 --     prefix [Nested: 4]
 --         prefix [Nested: 8]
 nesting :: (Int -> Doc ann) -> Doc ann
-nesting = Nesting
+nesting f = UnanD $ Nesting $ unDoc . f
 
 -- | @('width' doc f)@ lays out the document 'doc', and makes the column width
 -- of it available to a function.
@@ -1055,7 +1138,7 @@ width doc f
 --     prefix [Width: 32, ribbon fraction: 1.0]
 --         prefix [Width: 32, ribbon fraction: 1.0]
 pageWidth :: (PageWidth -> Doc ann) -> Doc ann
-pageWidth = WithPageWidth
+pageWidth f = UnanD $ WithPageWidth $ unDoc . f
 
 
 
@@ -1182,7 +1265,7 @@ surround x l r = l <> x <> r
 -- "Data.Text.Prettyprint.Doc.Render.Text", should be enough for the most common
 -- needs.
 annotate :: ann -> Doc ann -> Doc ann
-annotate = Annotated
+annotate ann (Doc d) = Doc $ Fix $ InR $ Annotate ann d
 
 -- | Remove all annotations.
 --
@@ -1198,6 +1281,9 @@ annotate = Annotated
 unAnnotate :: Doc ann -> Doc xxx
 unAnnotate = alterAnnotations (const [])
 
+unAnnotateNG :: Applicative f' => DocNG (Annotate ann) -> DocNG f'
+unAnnotateNG = bimapLang' unannotated (\(Annotate _ x) -> x)
+
 -- | Change the annotation of a 'Doc'ument.
 --
 -- Useful in particular to embed documents with one form of annotation in a more
@@ -1210,7 +1296,10 @@ unAnnotate = alterAnnotations (const [])
 -- Since @'reAnnotate'@ has the right type and satisfies @'reAnnotate id = id'@,
 -- it is used to define the @'Functor'@ instance of @'Doc'@.
 reAnnotate :: (ann -> ann') -> Doc ann -> Doc ann'
-reAnnotate re = alterAnnotations (pure . re)
+reAnnotate re = Doc . reAnnotateNG (first re) . unDoc
+
+reAnnotateNG :: (Functor f, Functor f') => (forall x. f x -> f' x) -> DocNG f -> DocNG f'
+reAnnotateNG re = bimapLang id re
 
 -- | Change the annotations of a 'Doc'ument. Individual annotations can be
 -- removed, changed, or replaced by multiple ones.
@@ -1228,23 +1317,10 @@ reAnnotate re = alterAnnotations (pure . re)
 -- rendered due to other layouts fitting better, it is preferrable to reannotate
 -- after producing the layout by using @'alterAnnotationsS'@.
 alterAnnotations :: (ann -> [ann']) -> Doc ann -> Doc ann'
-alterAnnotations re = go
+alterAnnotations re = Doc . go . unDoc
   where
-    go = \case
-        Fail     -> Fail
-        Empty    -> Empty
-        Char c   -> Char c
-        Text l t -> Text l t
-        Line     -> Line
-
-        FlatAlt x y     -> FlatAlt (go x) (go y)
-        Cat x y         -> Cat (go x) (go y)
-        Nest i x        -> Nest i (go x)
-        Union x y       -> Union (go x) (go y)
-        Column f        -> Column (go . f)
-        WithPageWidth f -> WithPageWidth (go . f)
-        Nesting f       -> Nesting (go . f)
-        Annotated ann x -> foldr Annotated (go x) (re ann)
+    go = bimapLang' unannotated $ \(Annotate ann x) ->
+        foldr (curry $ Fix . InR . uncurry Annotate) x (re ann)
 
 -- $
 -- >>> let doc = "lorem" <+> annotate () "ipsum" <+> "dolor"
@@ -1353,46 +1429,60 @@ data FusionDepth =
 -- >>> hsep (replicate 5 oftenUsed)
 -- abcd abcd abcd abcd abcd
 fuse :: FusionDepth -> Doc ann -> Doc ann
-fuse depth = go
+fuse depth = Doc . fuseNG fuseAnn . unDoc
   where
-    go = \case
-        Cat Empty x                   -> go x
-        Cat x Empty                   -> go x
-        Cat (Char c1) (Char c2)       -> Text 2 (T.singleton c1 <> T.singleton c2)
-        Cat (Text lt t) (Char c)      -> Text (lt+1) (T.snoc t c)
-        Cat (Char c) (Text lt t)      -> Text (1+lt) (T.cons c t)
-        Cat (Text l1 t1) (Text l2 t2) -> Text (l1+l2) (t1 <> t2)
+    fuseAnn
+        :: (DocNG (Annotate ann) -> DocNG (Annotate ann))
+        -> Annotate ann (DocNG f) -> DocNG (Annotate ann)
+    fuseAnn recur = \case
+        Annotate _ (Unan Empty) -> Unan Empty
+        Annotate a d -> Fix $ InR $ Annotate a $ recur d
 
-        Cat x@Char{} (Cat y@Char{} z) -> go (Cat (go (Cat x y)) z)
-        Cat x@Text{} (Cat y@Char{} z) -> go (Cat (go (Cat x y)) z)
-        Cat x@Char{} (Cat y@Text{} z) -> go (Cat (go (Cat x y)) z)
-        Cat x@Text{} (Cat y@Text{} z) -> go (Cat (go (Cat x y)) z)
+fuseNG :: (DocNG f -> DocNG f) -> DocNG f -> DocNG f
+fuseNG f depth = recur
+  where
+    recur = \case
+        Fix (InL x) -> docF x
+        Fix (InR x) -> Fix $ InR $ f recur x
+    docF :: DocF (DocNG f) -> DocNG f
+    docF = \case
+        Cat (Unan Empty) x                          -> go x
+        Cat x (Unan Empty)                          -> go x
+        Cat (Unan (Char c1)) (Unan (Char c2))       -> Unan $ Text 2 (T.singleton c1 <> T.singleton c2)
+        Cat (Unan (Text lt t)) (Unan (Char c))      -> Unan $ Text (lt+1) (T.snoc t c)
+        Cat (Unan (Char c)) (Unan (Text lt t))      -> Unan $ Text (1+lt) (T.cons c t)
+        Cat (Unan (Text l1 t1)) (Unan (Text l2 t2)) -> Unan $ Text (l1+l2) (t1 <> t2)
 
-        Cat (Cat x y@Char{}) z -> go (Cat x (go (Cat y z)))
-        Cat (Cat x y@Text{}) z -> go (Cat x (go (Cat y z)))
+        Cat x@(Unan Char{}) (Unan (Cat y@(Unan Char{}) z)) -> docF (Cat (go (Unan $ Cat x y)) z)
+        Cat x@(Unan Text{}) (Unan (Cat y@(Unan Char{}) z)) -> docF (Cat (go (Unan $ Cat x y)) z)
+        Cat x@(Unan Char{}) (Unan (Cat y@(Unan Text{}) z)) -> docF (Cat (go (Unan $ Cat x y)) z)
+        Cat x@(Unan Text{}) (Unan (Cat y@(Unan Text{}) z)) -> docF (Cat (go (Unan $ Cat x y)) z)
 
-        Cat x y -> Cat (go x) (go y)
+        Cat (Unan (Cat x y@(Unan Char{}))) z -> docF (Cat x (docF (Cat y z)))
+        Cat (Unan (Cat x y@(Unan Text{}))) z -> docF (Cat x (docF (Cat y z)))
 
-        Nest i (Nest j x) -> let !fused = Nest (i+j) x
-                             in go fused
-        Nest _ x@Empty{} -> x
-        Nest _ x@Text{}  -> x
-        Nest _ x@Char{}  -> x
+        Cat x y -> Unan $ Cat (go x) (go y)
+
+        Nest i (Unan (Nest j x)) -> let !fused = Nest (i+j) x
+                                    in docF fused
+        Nest _ x@(Unan Empty{}) -> x
+        Nest _ x@(Unan Text{})  -> x
+        Nest _ x@(Unan Char{})  -> x
         Nest 0 x         -> go x
-        Nest i x         -> Nest i (go x)
+        Nest i x         -> Unan $ Nest i (go x)
 
-        Annotated _ Empty -> Empty
+        _ :< Empty -> Empty
 
         FlatAlt x1 x2 -> FlatAlt (go x1) (go x2)
         Union x1 x2   -> Union (go x1) (go x2)
 
-        other | depth == Shallow -> other
+        other | depth == Shallow -> Unan other
 
         Column f        -> Column (go . f)
         WithPageWidth f -> WithPageWidth (go . f)
         Nesting f       -> Nesting (go . f)
 
-        other -> other
+        other -> Unan other
 
 
 
@@ -1721,7 +1811,7 @@ layoutWadlerLeijen
         Column f        -> best nl cc (Cons i (f cc) ds)
         WithPageWidth f -> best nl cc (Cons i (f pWidth) ds)
         Nesting f       -> best nl cc (Cons i (f i) ds)
-        Annotated ann x -> SAnnPush ann (best nl cc (Cons i x (UndoAnn ds)))
+        ann :< x -> SAnnPush ann (best nl cc (Cons i x (UndoAnn ds)))
 
     selectNicer
         :: FittingPredicate ann
@@ -1786,7 +1876,7 @@ layoutCompact doc = scan 0 [doc]
         Column f        -> scan col (f col:ds)
         WithPageWidth f -> scan col (f Unbounded : ds)
         Nesting f       -> scan col (f 0 : ds)
-        Annotated _ x   -> scan col (x:ds)
+        _ :< x   -> scan col (x:ds)
 
 -- | @('show' doc)@ prettyprints document @doc@ with 'defaultLayoutOptions',
 -- ignoring all annotations.
